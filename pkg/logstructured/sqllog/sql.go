@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/k3s-io/kine/pkg/broadcaster"
+	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -148,10 +149,10 @@ outer:
 				// last iteration because another client has compacted, or the requested revision has already been compacted.
 				if err == server.ErrCompacted {
 					break
-				} else {
-					logrus.Errorf("Compact failed: %v", err)
-					continue outer
 				}
+				logrus.Errorf("Compact failed: %v", err)
+				metrics.CompactTotal.WithLabelValues(metrics.ResultError).Inc()
+				continue outer
 			}
 		}
 
@@ -162,6 +163,8 @@ outer:
 		// Record the final results for the outer loop
 		compactRev = compactedRev
 		targetCompactRev = currentRev
+
+		metrics.CompactTotal.WithLabelValues(metrics.ResultSuccess).Inc()
 	}
 }
 
@@ -190,8 +193,9 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 		return compactRev, targetCompactRev, errors.Wrap(err, "failed to get compact revision")
 	}
 
+	// Check to see if another node already compacted. This is normal on a multi-server cluster.
 	if compactRev != dbCompactRev {
-		logrus.Tracef("COMPACT compact revision changed since last iteration: %d => %d", compactRev, dbCompactRev)
+		logrus.Infof("COMPACT compact revision changed since last iteration: %d => %d", compactRev, dbCompactRev)
 		return dbCompactRev, currentRev, server.ErrCompacted
 	}
 
@@ -200,11 +204,11 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 
 	// Don't bother compacting to a revision that has already been compacted
 	if targetCompactRev <= compactRev {
-		logrus.Tracef("COMPACT revision %d has already been compacted", targetCompactRev)
+		logrus.Infof("COMPACT revision %d has already been compacted", targetCompactRev)
 		return dbCompactRev, currentRev, server.ErrCompacted
 	}
 
-	logrus.Tracef("COMPACT compactRev=%d targetCompactRev=%d currentRev=%d", compactRev, targetCompactRev, currentRev)
+	logrus.Infof("COMPACT compactRev=%d targetCompactRev=%d currentRev=%d", compactRev, targetCompactRev, currentRev)
 
 	start := time.Now()
 	deletedRows, err := t.Compact(s.ctx, targetCompactRev)
@@ -217,7 +221,7 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 	}
 
 	t.MustCommit()
-	logrus.Debugf("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
+	logrus.Infof("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
 
 	return targetCompactRev, currentRev, nil
 }

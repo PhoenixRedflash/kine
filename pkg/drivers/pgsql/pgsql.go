@@ -8,12 +8,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib" // sql driver
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/logstructured"
 	"github.com/k3s-io/kine/pkg/logstructured/sqllog"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/k3s-io/kine/pkg/tls"
-	"github.com/lib/pq"
+	"github.com/k3s-io/kine/pkg/util"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 )
 
@@ -44,7 +48,7 @@ var (
 	createDB = "CREATE DATABASE "
 )
 
-func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig) (server.Backend, error) {
+func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoolConfig generic.ConnectionPoolConfig, metricsRegisterer prometheus.Registerer) (server.Backend, error) {
 	parsedDSN, err := prepareDSN(dataSourceName, tlsInfo)
 	if err != nil {
 		return nil, err
@@ -54,7 +58,7 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		return nil, err
 	}
 
-	dialect, err := generic.Open(ctx, "postgres", parsedDSN, connPoolConfig, "$", true)
+	dialect, err := generic.Open(ctx, "pgx", parsedDSN, connPoolConfig, "$", true, metricsRegisterer)
 	if err != nil {
 		return nil, err
 	}
@@ -77,10 +81,19 @@ func New(ctx context.Context, dataSourceName string, tlsInfo tls.Config, connPoo
 		) AS ks
 		WHERE kv.id = ks.id`
 	dialect.TranslateErr = func(err error) error {
-		if err, ok := err.(*pq.Error); ok && err.Code == "23505" {
+		if err, ok := err.(*pgconn.PgError); ok && err.Code == pgerrcode.UniqueViolation {
 			return server.ErrKeyExists
 		}
 		return err
+	}
+	dialect.ErrCode = func(err error) string {
+		if err == nil {
+			return ""
+		}
+		if err, ok := err.(*pgconn.PgError); ok {
+			return err.Code
+		}
+		return err.Error()
 	}
 
 	if err := setup(dialect.DB); err != nil {
@@ -95,7 +108,7 @@ func setup(db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
 
 	for _, stmt := range schema {
-		logrus.Tracef("SETUP EXEC : %v", generic.Stripped(stmt))
+		logrus.Tracef("SETUP EXEC : %v", util.Stripped(stmt))
 		_, err := db.Exec(stmt)
 		if err != nil {
 			return err
@@ -113,7 +126,7 @@ func createDBIfNotExist(dataSourceName string) error {
 	}
 
 	dbName := strings.SplitN(u.Path, "/", 2)[1]
-	db, err := sql.Open("postgres", dataSourceName)
+	db, err := sql.Open("pgx", dataSourceName)
 	if err != nil {
 		return err
 	}
@@ -121,22 +134,22 @@ func createDBIfNotExist(dataSourceName string) error {
 
 	err = db.Ping()
 	// check if database already exists
-	if _, ok := err.(*pq.Error); !ok {
+	if _, ok := err.(*pgconn.PgError); !ok {
 		return err
 	}
-	if err := err.(*pq.Error); err.Code != "42P04" {
-		if err.Code != "3D000" {
+	if err := err.(*pgconn.PgError); err.Code != pgerrcode.DuplicateDatabase {
+		if err.Code != pgerrcode.InvalidCatalogName {
 			return err
 		}
 		// database doesn't exit, will try to create it
 		u.Path = "/postgres"
-		db, err := sql.Open("postgres", u.String())
+		db, err := sql.Open("pgx", u.String())
 		if err != nil {
 			return err
 		}
 		defer db.Close()
 		stmt := createDB + dbName + ";"
-		logrus.Tracef("SETUP EXEC : %v", generic.Stripped(stmt))
+		logrus.Tracef("SETUP EXEC : %v", util.Stripped(stmt))
 		_, err = db.Exec(stmt)
 		if err != nil {
 			return err

@@ -10,11 +10,14 @@ import (
 	"github.com/k3s-io/kine/pkg/drivers/dqlite"
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/drivers/mysql"
+	"github.com/k3s-io/kine/pkg/drivers/nats"
 	"github.com/k3s-io/kine/pkg/drivers/pgsql"
 	"github.com/k3s-io/kine/pkg/drivers/sqlite"
+	"github.com/k3s-io/kine/pkg/metrics"
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/k3s-io/kine/pkg/tls"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/soheilhy/cmux"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -24,12 +27,14 @@ import (
 )
 
 const (
-	KineSocket      = "unix://kine.sock"
-	SQLiteBackend   = "sqlite"
-	DQLiteBackend   = "dqlite"
-	ETCDBackend     = "etcd3"
-	MySQLBackend    = "mysql"
-	PostgresBackend = "postgres"
+	KineSocket       = "unix://kine.sock"
+	SQLiteBackend    = "sqlite"
+	DQLiteBackend    = "dqlite"
+	ETCDBackend      = "etcd3"
+	JetStreamBackend = "jetstream"
+	NATSBackend      = "nats"
+	MySQLBackend     = "mysql"
+	PostgresBackend  = "postgres"
 )
 
 type Config struct {
@@ -39,6 +44,7 @@ type Config struct {
 	ConnectionPoolConfig generic.ConnectionPoolConfig
 	ServerTLSConfig      tls.Config
 	BackendTLSConfig     tls.Config
+	MetricsRegisterer    prometheus.Registerer
 }
 
 type ETCDConfig struct {
@@ -60,6 +66,14 @@ func Listen(ctx context.Context, config Config) (ETCDConfig, error) {
 	leaderelect, backend, err := getKineStorageBackend(ctx, driver, dsn, config)
 	if err != nil {
 		return ETCDConfig{}, errors.Wrap(err, "building kine")
+	}
+
+	if config.MetricsRegisterer != nil {
+		config.MetricsRegisterer.MustRegister(
+			metrics.SQLTotal,
+			metrics.SQLTime,
+			metrics.CompactTotal,
+		)
 	}
 
 	if err := backend.Start(ctx); err != nil {
@@ -226,13 +240,15 @@ func getKineStorageBackend(ctx context.Context, driver, dsn string, cfg Config) 
 	switch driver {
 	case SQLiteBackend:
 		leaderElect = false
-		backend, err = sqlite.New(ctx, dsn, cfg.ConnectionPoolConfig)
+		backend, err = sqlite.New(ctx, dsn, cfg.ConnectionPoolConfig, cfg.MetricsRegisterer)
 	case DQLiteBackend:
-		backend, err = dqlite.New(ctx, dsn, cfg.ConnectionPoolConfig)
+		backend, err = dqlite.New(ctx, dsn, cfg.ConnectionPoolConfig, cfg.MetricsRegisterer)
 	case PostgresBackend:
-		backend, err = pgsql.New(ctx, dsn, cfg.BackendTLSConfig, cfg.ConnectionPoolConfig)
+		backend, err = pgsql.New(ctx, dsn, cfg.BackendTLSConfig, cfg.ConnectionPoolConfig, cfg.MetricsRegisterer)
 	case MySQLBackend:
-		backend, err = mysql.New(ctx, dsn, cfg.BackendTLSConfig, cfg.ConnectionPoolConfig)
+		backend, err = mysql.New(ctx, dsn, cfg.BackendTLSConfig, cfg.ConnectionPoolConfig, cfg.MetricsRegisterer)
+	case NATSBackend, JetStreamBackend:
+		backend, err = nats.New(ctx, dsn, cfg.BackendTLSConfig)
 	default:
 		return false, nil, fmt.Errorf("storage backend is not defined")
 	}
@@ -246,6 +262,8 @@ func ParseStorageEndpoint(storageEndpoint string) (string, string) {
 	switch network {
 	case "":
 		return SQLiteBackend, ""
+	case "nats":
+		return NATSBackend, storageEndpoint
 	case "http":
 		fallthrough
 	case "https":
